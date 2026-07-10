@@ -38,13 +38,19 @@ final class PostProcessingJob: Identifiable {
     /// the finalized transcript. Call captures only — needs a diarized system stream.
     let exportVoiceprints: Bool
 
-    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false) {
+    /// Hidden-flag shadow-transcription config, read from UserDefaults at job
+    /// creation (the default-parameter expression evaluates when `init` runs,
+    /// which IS the spec's "read at job creation" semantics). Nil = flag off.
+    let shadowConfig: ShadowConfig?
+
+    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false, shadowConfig: ShadowConfig? = ShadowConfig.fromDefaults()) {
         self.id = handle.id
         self.handle = handle
         self.clusterThreshold = clusterThreshold
         self.numberOfSpeakers = numberOfSpeakers
         self.retention = retention
         self.exportVoiceprints = exportVoiceprints
+        self.shadowConfig = shadowConfig
     }
 
     /// Run the full pipeline. The main-actor boundary between steps is where
@@ -90,6 +96,7 @@ final class PostProcessingJob: Identifiable {
 
         var diarOutput: DiarizationOutput?
         var didRebuildSpeakers = false
+        var primaryResults: [ReTranscribedSegment]? = nil
         if let bufferURL = diarBufferURL {
             let fileSize = (try? FileManager.default.attributesOfItem(atPath: bufferURL.path)[.size] as? Int) ?? -1
             diagLog("[JOB \(id)] buffer file size=\(fileSize) bytes, exists=\(FileManager.default.fileExists(atPath: bufferURL.path))")
@@ -134,6 +141,7 @@ final class PostProcessingJob: Identifiable {
                     segments: segments,
                     speakerNumberBase: speakerBase
                 )
+                primaryResults = results
 
                 if Task.isCancelled {
                     // As above: keep the capture files so the orphan scan can recover.
@@ -219,6 +227,23 @@ final class PostProcessingJob: Identifiable {
                 // speech, too short, or a backend without centroids) — say so, don't go silent.
                 diagLog("[JOB \(id)] voiceprints enabled but none emitted (no rebuilt speakers / centroids for this session)")
             }
+        }
+
+        // 2c. Granite shadow transcription (hidden flag; spec 2026-07-09).
+        //     Best-effort and additive: runs while the capture WAVs still exist,
+        //     never throws, never touches the primary transcript or cleanup.
+        if GraniteShadowPhase.shouldRun(config: shadowConfig, didRebuild: didRebuildSpeakers,
+                                        primary: primaryResults),
+           let bufferURL = diarBufferURL, let diar = diarOutput {
+            await GraniteShadowPhase.run(
+                config: shadowConfig!, bufferURL: bufferURL, diarSegments: diar.segments,
+                speakerNumberBase: speakerBase, primary: primaryResults!,
+                session: ShadowSessionInfo(
+                    sessionID: id,
+                    transcriptPath: savedPath.path,
+                    sessionType: String(describing: handle.sessionType),
+                    primaryModel: await asr.activeModel?.displayName ?? "unknown",
+                    graniteModel: ShadowConfig.modelFilename))
         }
 
         // 3. Retain the combined recording before deleting the source WAVs. The
