@@ -2,7 +2,7 @@
 """Render granite shadow comparison JSONs into one side-by-side HTML report.
 Usage: python3 granite-shadow-report.py "~/Library/Application Support/Tome/GraniteShadow" [-o report.html]
 Stdlib only (spec §7)."""
-import argparse, difflib, html, json, pathlib
+import argparse, difflib, html, json, pathlib, sys
 
 
 def word_diff(a: str, b: str) -> tuple[float, str, str]:
@@ -28,8 +28,14 @@ def main():
     ap.add_argument("dir", type=pathlib.Path)
     ap.add_argument("-o", "--out", type=pathlib.Path, default=pathlib.Path("report.html"))
     args = ap.parse_args()
-    sessions = [json.loads(p.read_text())
-                for p in sorted(args.dir.expanduser().glob("*.comparison.json"))]
+    sessions = []
+    unreadable = 0
+    for p in sorted(args.dir.expanduser().glob("*.comparison.json")):
+        try:
+            sessions.append(json.loads(p.read_text()))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            print(f"warning: skipping malformed {p.name}: {e}", file=sys.stderr)
+            unreadable += 1
     rows, agg = [], {"sessions": len(sessions), "segments": 0, "errored": 0,
                      "audio": 0.0, "wall": 0.0, "disagree": 0}
     for s in sessions:
@@ -45,6 +51,7 @@ def main():
     body = ["<h1>Granite shadow report</h1>",
             f"<p>{agg['sessions']} sessions &middot; {agg['segments']} segments &middot; "
             f"{agg['disagree']} disagreeing (&gt;5% word diff) &middot; {agg['errored']} errored &middot; "
+            f"{unreadable} unreadable &middot; "
             f"aggregate shadow RTF {rtf:.3f}</p>",
             "<style>"
             "table{border-collapse:collapse;font-family:sans-serif}"

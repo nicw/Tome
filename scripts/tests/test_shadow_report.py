@@ -58,6 +58,22 @@ class ReportTest(unittest.TestCase):
             self.assertIn("requestFailed", html_text)
             self.assertIn("error", html_text.lower())
 
+    def test_malformed_file_skipped_with_warning_and_counted_in_header(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            (d / "good.comparison.json").write_text(json.dumps(SAMPLE))
+            (d / "bad.comparison.json").write_text("{not valid json")
+            out = d / "report.html"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), str(d), "-o", str(out)],
+                capture_output=True, text=True, check=True)
+            self.assertIn("bad.comparison.json", result.stderr)
+            html_text = out.read_text()
+            self.assertIn("1 unreadable", html_text)
+            # the good session's content still rendered despite the sibling
+            # malformed file
+            self.assertIn("grim", html_text)
+
     def test_incomplete_session_marked(self):
         sample = json.loads(json.dumps(SAMPLE))
         sample["session"]["sessionID"] = "s3"

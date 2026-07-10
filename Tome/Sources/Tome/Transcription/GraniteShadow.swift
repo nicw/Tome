@@ -216,7 +216,13 @@ enum ShadowArtifacts {
 enum GraniteShadowPhase {
     static func shouldRun(config: ShadowConfig?, didRebuild: Bool,
                           primary: [ReTranscribedSegment]?) -> Bool {
-        guard config != nil, didRebuild, let primary, !primary.isEmpty else { return false }
+        // Flag off is the common case — stay silent (spec: only log skips
+        // when the flag is actually on).
+        guard config != nil else { return false }
+        guard didRebuild, let primary, !primary.isEmpty else {
+            diagLog("[SHADOW] flag on but skipping shadow phase this session (didRebuild=\(didRebuild), primarySegments=\(primary?.count ?? 0))")
+            return false
+        }
         return true
     }
 
