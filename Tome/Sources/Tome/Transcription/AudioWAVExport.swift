@@ -1,0 +1,41 @@
+import AVFoundation
+
+/// Converts arbitrary PCM buffers to the 16 kHz mono PCM16 WAV bytes the
+/// granite sidecar consumes (granite_request.md pins format: "wav").
+enum AudioWAVExport {
+    enum ExportError: Error { case formatUnavailable, conversionFailed }
+
+    static func wav16kMonoPCM16(from buffer: AVAudioPCMBuffer) throws -> Data {
+        guard let outFmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
+                                         channels: 1, interleaved: true),
+              let converter = AVAudioConverter(from: buffer.format, to: outFmt)
+        else { throw ExportError.formatUnavailable }
+        let ratio = 16000.0 / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 4096
+        guard let out = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: capacity)
+        else { throw ExportError.conversionFailed }
+        var fed = false
+        var error: NSError?
+        converter.convert(to: out, error: &error) { _, status in
+            if fed { status.pointee = .endOfStream; return nil }
+            fed = true; status.pointee = .haveData; return buffer
+        }
+        if let error { throw error }
+        let byteCount = Int(out.frameLength) * 2
+        var data = riffHeader(dataByteCount: byteCount)
+        data.append(Data(bytes: out.int16ChannelData![0], count: byteCount))
+        return data
+    }
+
+    static func riffHeader(dataByteCount: Int) -> Data {
+        var d = Data()
+        func le32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func le16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        d.append(contentsOf: "RIFF".utf8); le32(UInt32(36 + dataByteCount))
+        d.append(contentsOf: "WAVE".utf8)
+        d.append(contentsOf: "fmt ".utf8); le32(16); le16(1) /* PCM */; le16(1) /* mono */
+        le32(16000); le32(16000 * 2) /* byte rate */; le16(2) /* block align */; le16(16)
+        d.append(contentsOf: "data".utf8); le32(UInt32(dataByteCount))
+        return d
+    }
+}
