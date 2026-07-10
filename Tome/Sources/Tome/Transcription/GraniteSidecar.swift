@@ -12,7 +12,11 @@ protocol SidecarProcessLauncher: Sendable {
 
 protocol SidecarHTTP: Sendable {
     func healthStatus(_ url: URL) async -> Int?
-    func post(_ url: URL, body: Data, timeout: TimeInterval) async throws -> Data
+    /// Returns the response body alongside its HTTP status so callers can
+    /// distinguish a 2xx-with-unparseable-body (ParseError, no relaunch) from
+    /// a 4xx/5xx (connection-class failure, relaunch path) — see
+    /// GraniteSidecar.transcribe.
+    func post(_ url: URL, body: Data, timeout: TimeInterval) async throws -> (Data, Int)
 }
 
 /// Owns one llama-server child process, spawn-per-job (spec §3): ~4 GB of
@@ -25,6 +29,16 @@ protocol SidecarHTTP: Sendable {
 actor GraniteSidecar {
     enum State: Equatable { case idle, ready, failed }
     enum SidecarError: Error { case notReady, requestFailed }
+
+    /// A non-2xx llama-server response. Thrown from transcribe()'s do-block
+    /// so the outer catch treats it exactly like a dropped connection (the
+    /// relaunch path) — the body here is opaque error text, not an
+    /// unparseable-but-2xx transcript shape, so it must NOT be confused with
+    /// GraniteRequest.ParseError.
+    private struct HTTPStatusError: Error, CustomStringConvertible {
+        let status: Int
+        var description: String { "HTTP \(status)" }
+    }
 
     private let config: ShadowConfig
     private let launcher: any SidecarProcessLauncher
@@ -67,13 +81,38 @@ actor GraniteSidecar {
                 return false
             }
         }
+        let healthURL = config.baseURL.appendingPathComponent("health")
+        // Pre-launch probe: if something is already answering /health on our
+        // port before we've launched anything, it's a foreign/orphaned
+        // llama-server (e.g. leaked by a prior crash) — refuse to adopt it.
+        // Launching on top would either fail to bind or silently hand our
+        // requests to a process we don't control and can't clean up.
+        if await http.healthStatus(healthURL) == 200 {
+            diagLog("[SHADOW] port \(config.port) already serving /health — refusing to adopt foreign llama-server (kill it or change graniteShadowPort)")
+            state = .failed
+            return false
+        }
+        // The probe above is an interleaving opportunity for stop() too.
+        guard generation == gen else {
+            state = .idle
+            return false
+        }
         do {
             process = try launcher.launch(
                 executable: URL(fileURLWithPath: config.serverPath),
                 arguments: ["-m", config.modelGGUF.path,
                             "--mmproj", config.mmprojGGUF.path,
                             "--host", "127.0.0.1",
-                            "--port", String(config.port)])
+                            "--port", String(config.port),
+                            // 16k context: granite supports it, and Q8 KV at
+                            // this size is fine on 64 GB (verified in
+                            // Phase 0). Note mtmd still internally chunks
+                            // audio >30s into 30s windows regardless of
+                            // context size — the resulting boundary-quality
+                            // caveat is tracked in the shadow-week results
+                            // doc, not addressed here.
+                            "-c", "16384",
+                            "--no-webui"])
         } catch {
             diagLog("[SHADOW] sidecar launch failed: \(error)")
             state = .failed
@@ -81,7 +120,16 @@ actor GraniteSidecar {
         }
         let iterations = Int(readyTimeout / 0.5)
         for _ in 0..<iterations {
-            let status = await http.healthStatus(config.baseURL.appendingPathComponent("health"))
+            // Check the child is still alive BEFORE polling — a dead child
+            // (e.g. a port-bind failure) would otherwise spin through the
+            // full readyTimeout before failing.
+            guard process?.isRunning == true else {
+                diagLog("[SHADOW] sidecar process exited before becoming healthy — failing")
+                await endProcess()
+                state = (generation == gen) ? .failed : .idle
+                return false
+            }
+            let status = await http.healthStatus(healthURL)
             // Both the healthStatus await above and the sleep below are
             // interleaving opportunities for stop(). Re-check the generation
             // BEFORE honoring a 200 — otherwise a stop() that already tore
@@ -111,7 +159,14 @@ actor GraniteSidecar {
             GraniteRequest.endpointPath.trimmingCharacters(in: CharacterSet(charactersIn: "/")))
         let body = GraniteRequest.build(wavData: wavData)
         do {
-            let data = try await http.post(url, body: body, timeout: 600)
+            let (data, status) = try await http.post(url, body: body, timeout: 600)
+            guard (200..<300).contains(status) else {
+                // llama-server responded but with an error status — the body
+                // is opaque error text, not the expected transcript shape, so
+                // this is a connection-class failure (relaunch/give-up path
+                // below), not a ParseError.
+                throw HTTPStatusError(status: status)
+            }
             return try GraniteRequest.parseResponse(data)
         } catch let error as GraniteRequest.ParseError {
             // A parse error means the server responded (200) but with an
@@ -124,8 +179,14 @@ actor GraniteSidecar {
             // interleaving opportunity). If so, honor the stop — don't
             // resurrect a process the caller already asked to tear down.
             guard state == .ready else { throw SidecarError.notReady }
-            // Any other thrown error from http.post is treated as a
-            // connection-level failure and triggers the single relaunch path.
+            if Task.isCancelled {
+                // Don't burn the one relaunch budget respawning a sidecar for
+                // a caller that's already gone — let the cancellation unwind.
+                throw error
+            }
+            // Any other thrown error from http.post (including the
+            // HTTPStatusError above) is treated as a connection-level failure
+            // and triggers the single relaunch path.
             guard !didRelaunch else {
                 diagLog("[SHADOW] request failed after relaunch — failing sidecar: \(error)")
                 await endProcess()
@@ -236,13 +297,13 @@ struct URLSessionSidecarHTTP: SidecarHTTP {
         guard let (_, resp) = try? await URLSession.shared.data(for: req) else { return nil }
         return (resp as? HTTPURLResponse)?.statusCode
     }
-    func post(_ url: URL, body: Data, timeout: TimeInterval) async throws -> Data {
+    func post(_ url: URL, body: Data, timeout: TimeInterval) async throws -> (Data, Int) {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.httpBody = body
         req.timeoutInterval = timeout
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let (data, _) = try await URLSession.shared.data(for: req)
-        return data
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        return (data, (resp as? HTTPURLResponse)?.statusCode ?? 0)
     }
 }
