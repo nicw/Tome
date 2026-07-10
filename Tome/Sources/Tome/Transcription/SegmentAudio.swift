@@ -40,13 +40,16 @@ enum SegmentAudio {
         return (startFrame, AVAudioFrameCount(frameCount))
     }
 
-    /// Read one segment's PCM out of an open file. Nil on allocation/read failure.
+    /// Read one segment's PCM out of an open file.
+    /// nil = allocation failure, caller skips; throws = read failure, caller decides
+    /// visibility (the primary re-transcriber surfaces a "[transcription failed]"
+    /// placeholder; a shadow runner may handle it differently).
     static func readSegment(file: AVAudioFile, start: AVAudioFramePosition,
-                            count: AVAudioFrameCount) -> AVAudioPCMBuffer? {
+                            count: AVAudioFrameCount) throws -> AVAudioPCMBuffer? {
         file.framePosition = start
         guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: count)
         else { return nil }
-        do { try file.read(into: buffer, frameCount: count) } catch { return nil }
+        try file.read(into: buffer, frameCount: count)
         return buffer
     }
 }

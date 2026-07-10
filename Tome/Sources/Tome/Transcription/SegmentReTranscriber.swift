@@ -32,8 +32,10 @@ struct SegmentReTranscriber: Sendable {
                     sampleRate: sampleRate, totalFrames: totalFrames
                 ) else { continue }
 
-                guard let buffer = SegmentAudio.readSegment(file: audioFile, start: range.start, count: range.count) else { continue }
                 do {
+                    // nil = buffer allocation failure → silent skip (as before); a read
+                    // failure throws into the catch below → "[transcription failed]".
+                    guard let buffer = try SegmentAudio.readSegment(file: audioFile, start: range.start, count: range.count) else { continue }
                     let result = try await asrCoordinator.transcribe(buffer: buffer, source: .system)
                     let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !text.isEmpty else { continue }
