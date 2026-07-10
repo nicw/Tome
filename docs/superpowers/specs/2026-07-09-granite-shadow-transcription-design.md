@@ -39,17 +39,24 @@ Research (2026-07-09, adversarially verified against primary sources):
 
 ## Goals
 
-- Behind a hidden flag (no UI), every post-processed session is *additionally*
-  transcribed by granite-speech-4.1-2b via a local `llama-server` sidecar,
-  producing a parallel transcript and a per-segment comparison artifact.
-- Both models see **byte-identical segment audio** (same diarization, same
-  merge/pad logic) so the comparison is apples-to-apples.
+- **Phase 0 (objective, first):** a benchmark harness measures real WER for
+  granite-via-llama.cpp vs Tome's current backends on public test corpora
+  with reference transcripts (AMI, Earnings-22, CORAAL sample), scored with
+  the leaderboard's normalizer — validating llama.cpp pipeline fidelity
+  against granite's published numbers before any Tome integration is trusted.
+- **Phase 1 (domain confirmation):** behind a hidden flag (no UI), every
+  post-processed session is *additionally* transcribed by
+  granite-speech-4.1-2b via a local `llama-server` sidecar, producing a
+  parallel transcript and a per-segment comparison artifact — a few days of
+  real meetings, confirming Phase 0 on Nic's actual audio domain (his mic
+  chain, meeting codecs, colleagues' accents, transcript readability).
+- Both models see **byte-identical segment audio** in shadow mode (same
+  diarization, same merge/pad logic) so the comparison is apples-to-apples.
 - Shadow is strictly best-effort: no shadow failure may fail, delay-block, or
   alter the primary transcript or the session lifecycle guarantees
   (WAV-preservation-on-failure, orphan recovery, retention).
-- After ~a week of real meetings, a report script renders all comparison
-  artifacts into one side-by-side HTML so Nic can judge whether granite's
-  leaderboard edge is real on his audio.
+- A report script renders all comparison artifacts into one side-by-side
+  HTML so Nic can judge the disagreements.
 - TDD throughout; existing 89-test suite stays green and untouched.
 
 ## Non-Goals (deferred until shadow results are in)
@@ -61,8 +68,9 @@ Research (2026-07-09, adversarially verified against primary sources):
 - Any `TranscriberModel` enum case, ModelProvisioner integration, or Settings
   UI for granite — the shadow model is not user-selectable.
 - `-plus` speaker-attribution vs SpeakerKit comparison (own experiment, later).
-- WER scoring against ground truth (no ground truth exists; human judgment on
-  disagreements is the metric).
+- WER scoring of the *shadow* data (Nic's meetings have no ground truth;
+  human judgment on disagreements is the shadow metric — objective WER lives
+  in Phase 0, where references exist).
 
 ## Decisions already made (with Nic)
 
@@ -70,10 +78,10 @@ Research (2026-07-09, adversarially verified against primary sources):
 |---|---|
 | Model | `granite-speech-4.1-2b` (AR base; not -nar, not -plus) |
 | Runtime | `llama-server` sidecar on IBM's official GGUFs (Q8_0 + f16 mmproj) |
-| Scope | Hidden-flag shadow comparison, ~a week of real meetings, then decide |
+| Scope | Phase 0 public-corpus benchmark first (objective WER, pipeline-fidelity gate), then hidden-flag shadow comparison for a few days of real meetings, then decide |
 | Speaker tagging | Stays SpeakerKit's job (per-segment pipeline); granite sees single-speaker segments |
 | Setup | Manual script (brew llama.cpp + curl model download) — **curl, not URLSession** (known Tome issue: URLSession can't reach the HF CDN on some networks) |
-| Bake-off | Folded into implementation task 1 (llama-server API smoke test + RTF measurement) rather than pre-design |
+| Bake-off | Superseded by Phase 0: the benchmark harness subsumes the smoke test and adds WER-with-references (Nic, 2026-07-09: "benchmark first + short shadow") |
 
 ## Current architecture facts this design builds on
 
@@ -103,6 +111,45 @@ Research (2026-07-09, adversarially verified against primary sources):
 - `swift test` needs `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
 
 ## Design
+
+### 0. Phase 0 — public-corpus benchmark (runs before any Tome integration)
+
+A standalone harness under `scripts/asr-bench/` (Python via `uv`, internal
+tool — dependency freedom, unlike the stdlib-only report script):
+
+- **Datasets:** the Open ASR Leaderboard's prepared ESB test sets on HF
+  (pre-segmented audio + references — the *same inputs* behind the published
+  numbers; exact dataset ids pinned at implementation from the
+  `open_asr_leaderboard` harness). Sets: **AMI test** (meetings; granite
+  in-domain), **Earnings-22 test** (accents/compression; granite in-domain),
+  and a **CORAAL sample** (held-out accent check — granite absent from the
+  long-form board that uses it). ~3–5 h per set — thousands of words, stable
+  deltas, sane runtime (granite est. RTF 0.03–0.15 → tens of minutes per set).
+- **Backends:**
+  - granite: the harness drives `llama-server` directly with the pinned
+    request template (see below) — no Swift required for Phase 0;
+  - Parakeet v3 + Whisper turbo: `ASRBench` gains a **manifest mode**
+    (`--manifest in.jsonl --out hyp.jsonl`: per-line WAV path in, hypothesis
+    out) so hypotheses come from Tome's *actual* backends, not a
+    reimplementation. No other ASRBench changes (the extraction refactor
+    stays deferred).
+- **Request template:** the llama-server request shape/prompt/params for
+  granite is pinned by this harness's smoke test and recorded in ONE place
+  (`scripts/asr-bench/granite_request.md`); the later Swift
+  `GraniteRequest.build(...)` implements the same template with a golden
+  test against it, so Phase 0 fidelity transfers to shadow mode.
+- **Scoring:** Whisper `EnglishTextNormalizer` on refs and hyps (same as the
+  leaderboard), WER via `jiwer`. Output: one table — per-set WER per backend,
+  with the leaderboard's published numbers alongside.
+- **Fidelity gate:** granite-on-our-stack must land within ~1.5 points
+  absolute of its published raw WER on AMI and Earnings-22. A miss means a
+  pipeline bug (resampling, prompt, chunking) — fix or fall back to
+  `llama-mtmd-cli` BEFORE building any Swift integration. This gate replaces
+  the old "one known-content clip" smoke test.
+
+Phase 0's deliverable is a committed results file
+(`docs/superpowers/plans/2026-07-09-granite-phase0-results.md`) with the
+table, RTF measurements on the M2 Max, and a go/no-go call for Phase 1.
 
 ### 1. Flag and configuration
 
@@ -146,9 +193,10 @@ States: `idle → launching → ready → terminating → idle`, plus `failed`.
 - `transcribe(wavData:) async throws -> String`: POST to the server's
   OpenAI-compatible chat completion endpoint with the audio as a base64
   `input_audio` content part and the granite ASR prompt, greedy decoding
-  (temperature 0). **Exact request shape/prompt is pinned by implementation
-  task 1's smoke test against the live server**, then frozen in one place
-  (`GraniteRequest.build(...)`, a pure function with tests).
+  (temperature 0). **The exact request shape/prompt was already pinned by the
+  Phase 0 harness** (`scripts/asr-bench/granite_request.md`);
+  `GraniteRequest.build(...)` is a pure function implementing that template,
+  with a golden test against it.
 - `stop()`: SIGTERM, escalate to SIGKILL after 5 s. Also invoked from app
   termination and `deinit` defensively — a leaked llama-server must not
   outlive Tome.
@@ -260,20 +308,28 @@ No WER claims — no ground truth. The report structures Nic's eyeball pass.
   unchanged; solo-memo session → skip. Also: WAVs still present when the
   phase runs (ordering regression test).
 - **`ShadowConfig`:** defaults parsing, path expansion, disabled default.
+- **ASRBench manifest mode:** manifest parse/emit as pure functions with unit
+  tests; the transcribe loop reuses the existing bench plumbing.
 - Report script: golden-input test run in CI via `python3` if available,
   else exercised manually (script is stdlib-only, deterministic).
+- Phase 0 harness: validated by its own fidelity gate (reproducing published
+  numbers IS the test); no CI coverage — it's a run-once-per-decision tool.
 
 ## Risks / open questions
 
 - **llama-server audio API details** (exact endpoint shape/prompt for mtmd
-  audio) are pinned by implementation task 1's smoke test before any Swift
-  HTTP code is written. If the server path proves broken for granite audio,
-  fallback is shelling out to `llama-mtmd-cli` per segment (same artifacts,
-  worse latency) — decided at task 1, not later.
-- **llama.cpp front-end WER fidelity** vs Python reference is exactly what
-  the shadow week measures — but a gross fidelity bug (e.g. resampling error)
-  would masquerade as "granite is bad". Task 1's smoke test includes one
-  known-content clip sanity check.
+  audio) are pinned by the Phase 0 harness before any Swift HTTP code is
+  written. If the server path proves broken for granite audio, fallback is
+  shelling out to `llama-mtmd-cli` per segment (same artifacts, worse
+  latency) — decided in Phase 0, not later.
+- **llama.cpp front-end WER fidelity** is measured directly by Phase 0's
+  fidelity gate (reproduce published AMI/Earnings-22 numbers within ~1.5
+  points) — a gross fidelity bug can no longer masquerade as "granite is
+  bad" in the shadow data.
+- **Phase 0 flatters granite on AMI/Earnings-22** (their train splits are in
+  granite's training data). The CORAAL held-out check and the shadow pass on
+  Nic's real meetings are the counterweights; a granite win that appears
+  ONLY on the in-domain sets is a yellow flag, not a green one.
 - **Job duration grows** by the shadow time (est. 2–10 min per meeting hour);
   the Settings model-picker lock window grows with it. Accepted for the
   experiment; the report's RTF numbers feed the eventual dual-slot design.
@@ -284,15 +340,24 @@ No WER claims — no ground truth. The report structures Nic's eyeball pass.
   pipeline shape*, not granite's ceiling. Noted so a mediocre result prompts
   "try longer windows" before "reject model".
 
-## Success criteria (end-of-week decision)
+## Success criteria
 
-Promote granite to the full dual-slot design if, on real meetings:
-1. Granite's RTF on M2 Max ≤ ~0.25 (hour meeting in ≤ 15 min), and
-2. Nic's judgment on the top-disagreement segments favors granite clearly
+**Phase 0 gates (before building shadow mode):**
+1. Fidelity: granite via our llama-server pipeline reproduces its published
+   AMI + Earnings-22 raw WER within ~1.5 points absolute.
+2. Speed: RTF on M2 Max ≤ ~0.25 (hour meeting in ≤ 15 min).
+3. Accuracy: granite beats BOTH current backends on AMI and Earnings-22, and
+   at least matches Parakeet v3 on the held-out CORAAL sample (a win only on
+   in-domain sets is a yellow flag → discuss before proceeding).
+
+**Phase 1 confirmation (a few days of real-meeting shadow data):**
+4. Nic's judgment on the top-disagreement segments favors granite clearly
    more often than the primary (names, accents, cross-talk are the cases to
    watch), and
-3. No systemic pathologies (hallucinated segments, dropped words in noise,
+5. No systemic pathologies (hallucinated segments, dropped words in noise,
    repetition loops) beyond what the primary shows.
-Otherwise: keep the artifacts, write up findings, revisit when runtimes/models
-move (the research memo lists granite-4.1-2b-plus and higgs-2.7B as the next
-candidates to re-check).
+
+All five → promote granite to the full dual-slot design. Otherwise: keep the
+artifacts, write up findings, revisit when runtimes/models move (the research
+memo lists granite-4.1-2b-plus and higgs-2.7B as the next candidates to
+re-check).
