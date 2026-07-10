@@ -17,51 +17,23 @@ struct SegmentReTranscriber: Sendable {
         do {
             let audioFile = try AVAudioFile(forReading: fileURL)
             let sampleRate = audioFile.processingFormat.sampleRate
-            let totalFrames = AVAudioFrameCount(audioFile.length)
+            let totalFrames = AVAudioFramePosition(audioFile.length)
 
             let speakerMap = speakerLabels(from: segments.map(\.speakerId), startingAt: speakerNumberBase)
 
             // Merge consecutive segments from the same speaker (< 0.5s gap)
-            var merged: [DiarizedSegment] = []
-            for seg in segments {
-                if let last = merged.last, last.speakerId == seg.speakerId,
-                   seg.startTime - last.endTime < 0.5 {
-                    merged[merged.count - 1] = DiarizedSegment(
-                        speakerId: last.speakerId,
-                        startTime: last.startTime,
-                        endTime: seg.endTime
-                    )
-                } else {
-                    merged.append(seg)
-                }
-            }
+            let merged = SegmentAudio.merge(segments)
 
             var output: [ReTranscribedSegment] = []
 
-            let minSamples = Int(sampleRate * 1.5) // 1.5s to clear Parakeet's 1s minimum after resampling
-
             for seg in merged {
-                var startFrame = AVAudioFramePosition(Double(seg.startTime) * sampleRate)
-                var endFrame = min(AVAudioFramePosition(Double(seg.endTime) * sampleRate), AVAudioFramePosition(totalFrames))
-                var frameCount = Int(endFrame - startFrame)
+                guard let range = SegmentAudio.paddedFrameRange(
+                    startTime: seg.startTime, endTime: seg.endTime,
+                    sampleRate: sampleRate, totalFrames: totalFrames
+                ) else { continue }
 
-                // Pad short segments to meet Parakeet's minimum
-                if frameCount < minSamples && frameCount > 0 {
-                    let deficit = minSamples - frameCount
-                    let padBefore = min(AVAudioFramePosition(deficit / 2), startFrame)
-                    let padAfter = min(deficit - Int(padBefore), Int(AVAudioFramePosition(totalFrames) - endFrame))
-                    startFrame -= padBefore
-                    endFrame += AVAudioFramePosition(padAfter)
-                    frameCount = Int(endFrame - startFrame)
-                }
-
-                guard frameCount > 0 else { continue }
-                let avFrameCount = AVAudioFrameCount(frameCount)
-
-                audioFile.framePosition = startFrame
-                guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: avFrameCount) else { continue }
+                guard let buffer = SegmentAudio.readSegment(file: audioFile, start: range.start, count: range.count) else { continue }
                 do {
-                    try audioFile.read(into: buffer, frameCount: avFrameCount)
                     let result = try await asrCoordinator.transcribe(buffer: buffer, source: .system)
                     let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !text.isEmpty else { continue }
