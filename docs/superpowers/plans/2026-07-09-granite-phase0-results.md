@@ -66,4 +66,93 @@ data collection on real meetings proceeds; review EOD Wednesday 2026-07-15.
 
 ## Live smoke (Task 13)
 
-_To be appended after install._
+Run: 2026-07-10, ~00:00–00:08 local, unattended (Nic asleep), on his live
+machine. Build SHA `f8796209fb7f1aebf562891089d8bb0129e48a5d` (HEAD at the
+time — this doc's own "GO" commit; no code changes since). `swift test`: 129
+tests passed. Built via `scripts/build_swift_app.sh` (auto-install step
+temporarily disabled for a controlled backup/quit/ditto install, then the
+script's edit was reverted — `git status` clean throughout and after).
+
+**Install.** Backed up the running v1.4.4 app to `/tmp/tome-backup/Tome.app.bak`
+(codesign/byte-identical verified). Confirmed no active session (`/health`:
+`isRecording:false`; `/status`: `idle`) before quitting. Quit via
+`osascript … quit app "Tome"` (clean exit, ~2 s). `ditto`'d the new build
+(same `Tome Self-Signed` identity, so Screen Recording/Mic TCC grants carried
+over — confirmed empirically, see below) over `/Applications/Tome.app`.
+`defaults write com.dloomis.tome graniteShadowEnabled -bool YES`. Relaunched;
+`/health` answered within ~1 s.
+
+**Deviation — orphan-WAV relocation.** 12 pre-existing crashed-recording WAVs
+sat in `~/Library/Application Support/Tome/sessions/` from Nic's own past
+sessions (unrelated to this work). `ContentView.checkForOrphanedSessionsOnce()`
+runs a blocking `NSAlert.runModal()` on relaunch when orphans are found, which
+starves the `@MainActor`-bound API (`/health` hangs) with no way to dismiss it
+headlessly. To keep the relaunch unattended-safe, the 12 WAVs were `mv`'d to a
+scratch holding dir immediately before quitting Tome and `mv`'d back right
+after `/health` confirmed the new process was up (past the once-per-launch
+scan). MD5 of all 12 files verified identical before move, after move, and
+again at end-of-run — zero data loss, nothing recovered/discarded. This is a
+real, pre-existing product gap (a launch-time modal can starve the local API)
+worth a follow-up but out of scope here.
+
+**Live smoke — silent-tap result: needed a display wake, not a volume bump.**
+First attempt at output volume 0 failed as a genuine capture start failure,
+not muted audio: `[ENGINE-5-FAIL] Failed to start system audio: … CaptureError
+error 0` (= `.noDisplay`) immediately on start. Root-caused via unified log
+(`log show --predicate 'subsystem == "com.apple.TCC"'`): Screen Recording TCC
+was fine (`AUTHREQ_RESULT authValue=2` = allowed, confirmed for
+`com.dloomis.tome` against `kTCCServiceScreenCapture`) — the actual cause was
+`system_profiler SPDisplaysDataType` showing `Display Asleep: Yes`.
+ScreenCaptureKit's `SCShareableContent` returns zero displays while the
+built-in display is idle-asleep, which the call-capture system-audio tap
+depends on even for audio-only capture. This is expected during real meetings
+(display is always awake then) but not at midnight with nobody at the
+keyboard — an artifact of unattended testing, not a shadow-transcription bug.
+A second attempt at volume 0 (no display change) failed identically,
+confirming it wasn't a launch-warm-up race. One retry (per brief) was spent
+addressing the diagnosed cause instead of the brief's volume-15 fallback
+(which would not have fixed a zero-display condition): woke the display for
+~35 s via `caffeinate -u -d -t 35`, re-ran at output volume 0/muted (still
+fully silent), then let the timer expire naturally — display returned to
+`Display Asleep: Yes` on its own, matching the state found at task start; no
+brightness/settings changed.
+
+- Session `session_2026-07-10_00-06-59` (subject "Task 13 Granite Shadow
+  Smoke Test Retry2"), call capture, 34 s, volume held at 0 throughout capture
+  and speech.
+- Primary transcript (Whisper large-v3-turbo): 3 real utterances across
+  "Speaker 2/3/4" (diarization split the second voice in two), text matches
+  the two spoken passages verbatim modulo casing/punctuation.
+- `session_2026-07-10_00-06-59.granite.md` and `.comparison.json` both
+  appeared in `~/Library/Application Support/Tome/GraniteShadow/`, paired
+  correctly by session ID. Granite text contains all the distinguishing
+  content words from both passages ("quarterly planning", "granite shadow
+  transcription rollout", "budget allocations", "customer onboarding
+  metrics", "follow-up meeting for next tuesday").
+- Shadow totals from the comparison JSON: 3 segments, 0 errored, 24.36 s
+  audio, 1.156 s shadow wall-clock → **RTF 0.0474** — matches the Phase 0
+  benchmark RTF (~0.05) closely.
+- `pgrep llama-server` empty after the job completed — spawn-per-job
+  lifecycle confirmed on a real session, not just in Phase 0's harness.
+- `python3 scripts/granite-shadow-report.py "~/Library/Application
+  Support/Tome/GraniteShadow" -o /tmp/shadow-smoke-report.html` rendered (3
+  segments); report HTML contains the same passage phrases.
+
+**Verdict: PASS.** Silent (volume-0) system-audio tap capture works and the
+full granite shadow pipeline (spawn sidecar → transcribe → compare → write
+artifacts → stop sidecar) ran correctly end-to-end on a real installed build,
+with the one caveat above (needs an awake display — true of real meetings,
+not of this unattended test window).
+
+**End state confirmed:** Tome running (new build, `graniteShadowEnabled=YES`),
+`isRecording:false`, output volume restored to 50/unmuted (pre-task baseline),
+display back to idle-asleep (pre-task state), no `llama-server` process, no
+stray `say` processes, the 12 pre-existing orphan WAVs untouched (MD5-verified),
+two failed-attempt test artifacts (empty transcripts/recordings from the
+display-asleep failures) deleted from Nic's vault, the one successful smoke
+session's transcript/recording/voiceprints left in place as evidence,
+`/tmp/tome-backup/Tome.app.bak` left in place as a rollback point, `git
+status` clean except this doc.
+
+Shadow is live for Friday's meetings; review lands EOD Wednesday 2026-07-15
+via `scripts/granite-shadow-report.py`.
