@@ -42,6 +42,8 @@ struct ShadowRunner: Sendable {
         let sampleRate = audioFile.processingFormat.sampleRate
         let totalFrames = AVAudioFramePosition(audioFile.length)
         let merged = SegmentAudio.merge(diarSegments)
+        // merge() preserves first-occurrence order of distinct speaker IDs, so
+        // labels match SegmentReTranscriber's raw-array map.
         let speakerMap = speakerLabels(from: merged.map(\.speakerId), startingAt: speakerNumberBase)
         var results: [ShadowSegment] = []
         var incomplete = false
@@ -90,8 +92,17 @@ struct ShadowRunner: Sendable {
                                              durationSec: duration, text: nil,
                                              error: String(describing: error),
                                              latencySec: secondsSince(t0, clock: clock)))
-                if let sidecarError = error as? GraniteSidecar.SidecarError, case .notReady = sidecarError {
-                    incomplete = true; break   // sidecar dead/stopped — stop burning segments
+                if let sidecarError = error as? GraniteSidecar.SidecarError {
+                    // .notReady = sidecar dead/stopped; .requestFailed =
+                    // relaunch budget exhausted, process torn down. Either way
+                    // the sidecar is gone — stop burning segments. (Exhaustive
+                    // switch so a future recoverable case must pick its policy
+                    // here at compile time.)
+                    switch sidecarError {
+                    case .notReady, .requestFailed:
+                        incomplete = true
+                    }
+                    break
                 }
             }
         }
@@ -198,8 +209,7 @@ enum ShadowArtifacts {
 enum GraniteShadowPhase {
     static func shouldRun(config: ShadowConfig?, didRebuild: Bool,
                           primary: [ReTranscribedSegment]?) -> Bool {
-        guard let config, didRebuild, let primary, !primary.isEmpty else { return false }
-        _ = config
+        guard config != nil, didRebuild, let primary, !primary.isEmpty else { return false }
         return true
     }
 

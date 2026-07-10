@@ -106,6 +106,18 @@ private struct Boom: Error {}
         #expect(out.incomplete)
     }
 
+    // -- requestFailed means the sidecar is equally dead (relaunch budget
+    // exhausted, process torn down by GraniteSidecar) — same early-break --
+    @Test func runnerStopsAndMarksIncompleteOnSidecarRequestFailed() async throws {
+        let wav = try fixtureWAV()
+        let segs = [DiarizedSegment(speakerId: "S0", startTime: 0.0, endTime: 2.0),
+                    DiarizedSegment(speakerId: "S1", startTime: 3.0, endTime: 5.0)]
+        let runner = ShadowRunner(transcriber: FakeSegmentTranscriber([.failure(GraniteSidecar.SidecarError.requestFailed)]))
+        let out = await runner.run(fileURL: wav, diarSegments: segs, speakerNumberBase: 2)
+        #expect(out.segments.count == 1)   // exactly one attempt — no extra segment burned
+        #expect(out.incomplete)
+    }
+
     // -- cancellation mid-run: partial results preserved, marked incomplete --
     /// A transcriber that signals a continuation after its first call so the
     /// test can cancel the enclosing Task from outside, simulating cooperative
