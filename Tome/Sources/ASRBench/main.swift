@@ -7,6 +7,7 @@
 // Usage: swift run -c release ASRBench <wav/m4a...> [--json out.json]
 
 import AVFoundation
+import BenchSupport
 import Foundation
 import FluidAudio
 import WhisperKit
@@ -24,6 +25,36 @@ let whisperBase = FileManager.default.urls(for: .applicationSupportDirectory, in
 let sampleRate = 16_000.0
 let maxChunkSamples = 480_000
 let minChunkSamples = 8_000
+
+// Manifest mode: ASRBench --manifest in.jsonl --backend parakeet|whisper --out hyp.jsonl
+// Reuses the same hand-mirrored model config as the bench functions below (keep in sync).
+if let mi = CommandLine.arguments.firstIndex(of: "--manifest") {
+    let args = CommandLine.arguments
+    guard args.count > mi + 1,
+          let bi = args.firstIndex(of: "--backend"), args.count > bi + 1,
+          let oi = args.firstIndex(of: "--out"), args.count > oi + 1 else {
+        FileHandle.standardError.write(Data("usage: ASRBench --manifest in.jsonl --backend parakeet|whisper --out hyp.jsonl\n".utf8))
+        exit(2)
+    }
+    let entries = try BenchManifest.parse(String(contentsOfFile: args[mi + 1], encoding: .utf8))
+    let backend = args[bi + 1]
+    // Extract the model-loading half of benchParakeet()/benchWhisper() into
+    // loadParakeet() / loadWhisper() helpers returning a `(String) async throws -> String`
+    // transcribe closure (WAV path in, text out), reusing the existing sample-loading
+    // code these bench functions already use for their own WAVs.
+    let transcribe: (String) async throws -> String = backend == "whisper"
+        ? try await loadWhisper()
+        : try await loadParakeet()
+    var hyps: [HypothesisEntry] = []
+    for (i, e) in entries.enumerated() {
+        let text = (try? await transcribe(e.wav)) ?? ""
+        hyps.append(HypothesisEntry(id: e.id, text: text))
+        if i % 50 == 0 { print("[\(backend)] \(i)/\(entries.count)") }
+    }
+    try BenchManifest.emit(hyps).write(toFile: args[oi + 1], atomically: true, encoding: .utf8)
+    print("[\(backend)] wrote \(hyps.count) hypotheses → \(args[oi + 1])")
+    exit(0)
+}
 
 var argv = Array(CommandLine.arguments.dropFirst())
 var jsonOut: String?
@@ -80,7 +111,15 @@ func peakRSSMB() -> Double {
 func now() -> Double { CFAbsoluteTimeGetCurrent() }
 
 // --- Parakeet ---
-func benchParakeet(chunks: [[Float]]) async throws -> BackendReport {
+
+// Model-loading half of benchParakeet(): downloads (if needed), does a cold
+// load then a warm load (mirroring the bench's cold/warm timing dance), and
+// hands back the warm-loaded manager plus the report fields benchParakeet()
+// needs (download/load timings, cache dir). Also used directly by manifest
+// mode via the `transcribe` closure it derives its own wrapper from.
+func loadParakeetManager() async throws -> (
+    asr: AsrManager, downloadSeconds: Double?, dir: URL, loadCold: Double, loadWarm: Double
+) {
     let cached = AsrModels.modelsExist(
         at: AsrModels.defaultCacheDirectory(for: .v3), version: .v3)
     let tDownload = now()
@@ -98,6 +137,26 @@ func benchParakeet(chunks: [[Float]]) async throws -> BackendReport {
     let warmModels = try await AsrModels.load(from: dir, version: .v3)
     try await asr.loadModels(warmModels)
     let loadWarm = now() - tWarm
+
+    return (asr, downloadSeconds, dir, loadCold, loadWarm)
+}
+
+// Manifest-mode helper: loads Parakeet and returns a (WAV path in, text out)
+// transcribe closure, reusing loadParakeetManager()'s load path and the same
+// AudioProcessor.loadAudioAsFloatArray sample-loading the top-level bench
+// driver uses for its own files.
+func loadParakeet() async throws -> (String) async throws -> String {
+    let (asr, _, _, _, _) = try await loadParakeetManager()
+    return { path in
+        let samples = try AudioProcessor.loadAudioAsFloatArray(fromPath: path)
+        var state = TdtDecoderState.make()
+        let result = try await asr.transcribe(samples, decoderState: &state, language: .english)
+        return result.text
+    }
+}
+
+func benchParakeet(chunks: [[Float]]) async throws -> BackendReport {
+    let (asr, downloadSeconds, dir, loadCold, loadWarm) = try await loadParakeetManager()
 
     func transcribe(_ samples: [Float]) async throws -> Double {
         var state = TdtDecoderState.make()
@@ -121,7 +180,14 @@ func benchParakeet(chunks: [[Float]]) async throws -> BackendReport {
 }
 
 // --- Whisper ---
-func benchWhisper(chunks: [[Float]], variant: String, base: URL) async throws -> BackendReport {
+
+// Model-loading half of benchWhisper(): resolves/downloads the model folder,
+// does a cold load then a warm load (mirroring the bench's cold/warm timing
+// dance), and hands back the warm-loaded kit plus the report fields
+// benchWhisper() needs (download timing, folder, variant).
+func loadWhisperKit(variant: String, base: URL) async throws -> (
+    kit: WhisperKit, downloadSeconds: Double?, folder: URL, loadCold: Double, loadWarm: Double
+) {
     let expectedFolder = base.appendingPathComponent(
         "models/argmaxinc/whisperkit-coreml/\(variant)", isDirectory: true)
     let cached = FileManager.default.fileExists(
@@ -150,6 +216,28 @@ func benchWhisper(chunks: [[Float]], variant: String, base: URL) async throws ->
     let tWarm = now()
     let kit = try await WhisperKit(config)
     let loadWarm = now() - tWarm
+
+    return (kit, downloadSeconds, folder, loadCold, loadWarm)
+}
+
+// Manifest-mode helper: loads Whisper (default family/base, same as the top-
+// level bench driver uses) and returns a (WAV path in, text out) transcribe
+// closure, reusing loadWhisperKit()'s load path and the existing
+// AudioProcessor.loadAudioAsFloatArray sample-loading code.
+func loadWhisper() async throws -> (String) async throws -> String {
+    let (kit, _, _, _, _) = try await loadWhisperKit(variant: whisperVariant, base: whisperBase)
+    return { path in
+        let samples = try AudioProcessor.loadAudioAsFloatArray(fromPath: path)
+        let results = try await kit.transcribe(
+            audioArray: samples,
+            decodeOptions: DecodingOptions(task: .transcribe, language: "en"))
+        return results.map(\.text).joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+func benchWhisper(chunks: [[Float]], variant: String, base: URL) async throws -> BackendReport {
+    let (kit, downloadSeconds, folder, loadCold, loadWarm) = try await loadWhisperKit(variant: variant, base: base)
 
     func transcribe(_ samples: [Float]) async throws -> Double {
         let t = now()

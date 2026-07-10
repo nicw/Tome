@@ -43,12 +43,20 @@ let package = Package(
             ],
             path: "Sources/VoiceprintAudit"
         ),
+        // JSONL manifest parse/emit shared by ASRBench (manifest mode) and its
+        // tests. Plain library, no ASR deps — kept separate so TomeTests can
+        // depend on it without pulling in FluidAudio/WhisperKit.
+        .target(
+            name: "BenchSupport",
+            path: "Sources/BenchSupport"
+        ),
         // ASR load-test harness comparing Parakeet vs Whisper latency (see
         // docs/superpowers/specs/2026-07-08-*.md §8). Not part of the app;
         // never run in CI (downloads GBs of models, needs ANE).
         .executableTarget(
             name: "ASRBench",
             dependencies: [
+                "BenchSupport",
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "WhisperKit", package: "argmax-oss-swift"),
             ],
@@ -60,7 +68,7 @@ let package = Package(
         // Nothing here touches audio devices, permissions, or the ASR models.
         .testTarget(
             name: "TomeTests",
-            dependencies: ["Tome"],
+            dependencies: ["Tome", "BenchSupport"],
             path: "Tests/TomeTests"
         ),
     ]
