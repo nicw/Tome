@@ -45,6 +45,17 @@ actor GraniteSidecar {
     private let http: any SidecarHTTP
     private let readyTimeout: TimeInterval
     private let sleep: @Sendable (TimeInterval) async -> Void
+    /// App-quit gate, checked at BOTH spawn points (start(), and the relaunch
+    /// branch in transcribe()). SidecarRegistry.killAll() blocks the main
+    /// thread during quit, but this actor keeps running on its own executor —
+    /// without the gate, an in-flight transcribe() whose connection drops
+    /// while its server is being killed takes the relaunch branch (state
+    /// still .ready, Task not cancelled, didRelaunch false) and spawns +
+    /// registers a FRESH child after killAll's victim snapshot, reproducing
+    /// the very orphan the registry exists to prevent. Injectable so tests
+    /// stay deterministic and isolated from the permanent process-global flag
+    /// (which other tests in the same process may flip via killAll()).
+    private let isQuitting: @Sendable () -> Bool
     private var process: (any SidecarProcess)?
     private var didRelaunch = false
     /// Monotonic teardown generation (pattern: ASRCoordinator.lastInstallToken).
@@ -58,16 +69,23 @@ actor GraniteSidecar {
          launcher: any SidecarProcessLauncher = DefaultProcessLauncher(),
          http: any SidecarHTTP = URLSessionSidecarHTTP(),
          readyTimeout: TimeInterval = 60,
-         sleep: @Sendable @escaping (TimeInterval) async -> Void = { try? await Task.sleep(for: .seconds($0)) }) {
+         sleep: @Sendable @escaping (TimeInterval) async -> Void = { try? await Task.sleep(for: .seconds($0)) },
+         isQuitting: @Sendable @escaping () -> Bool = { SidecarRegistry.isQuitting }) {
         self.config = config
         self.launcher = launcher
         self.http = http
         self.readyTimeout = readyTimeout
         self.sleep = sleep
+        self.isQuitting = isQuitting
     }
 
     @discardableResult
     func start() async -> Bool {
+        guard !isQuitting() else {
+            diagLog("[SHADOW] app quitting — refusing sidecar launch")
+            state = .failed
+            return false
+        }
         let gen = generation
         // Guard against a second start() while a process is already tracked
         // (ready or mid-poll) — without this, the prior handle would be
@@ -87,14 +105,18 @@ actor GraniteSidecar {
         // llama-server (e.g. leaked by a prior crash) — refuse to adopt it.
         // Launching on top would either fail to bind or silently hand our
         // requests to a process we don't control and can't clean up.
-        if await http.healthStatus(healthURL) == 200 {
-            diagLog("[SHADOW] port \(config.port) already serving /health — refusing to adopt foreign llama-server (kill it or change graniteShadowPort)")
-            state = .failed
-            return false
-        }
-        // The probe above is an interleaving opportunity for stop() too.
+        let probeStatus = await http.healthStatus(healthURL)
+        // The probe await is an interleaving opportunity for stop() —
+        // re-check the generation BEFORE acting on the probe result, in
+        // either direction: a stale 200 must not stomp .failed over the
+        // .idle a concurrent stop() just established.
         guard generation == gen else {
             state = .idle
+            return false
+        }
+        if probeStatus == 200 {
+            diagLog("[SHADOW] port \(config.port) already serving /health — refusing to adopt foreign llama-server (kill it or change graniteShadowPort)")
+            state = .failed
             return false
         }
         do {
@@ -182,6 +204,14 @@ actor GraniteSidecar {
             if Task.isCancelled {
                 // Don't burn the one relaunch budget respawning a sidecar for
                 // a caller that's already gone — let the cancellation unwind.
+                throw error
+            }
+            if isQuitting() {
+                // App is exiting; the connection likely dropped BECAUSE
+                // SidecarRegistry.killAll() just terminated our server. Same
+                // treatment as cancellation: rethrow without relaunching —
+                // spawning a fresh child now would orphan it past killAll's
+                // victim snapshot.
                 throw error
             }
             // Any other thrown error from http.post (including the

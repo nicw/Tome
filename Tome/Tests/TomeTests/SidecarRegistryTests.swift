@@ -82,6 +82,19 @@ import Testing
         #expect(count == 0)
     }
 
+    @Test func killAllFlipsThePermanentQuittingGate() {
+        // The gate is never reset (the app is exiting), so this can only
+        // assert the forward direction: after killAll, isQuitting is true —
+        // including on an empty registry (the flip must not be skipped by the
+        // nothing-to-kill early return). GraniteSidecarTests inject their own
+        // gate closure precisely because this flip is permanent process-global
+        // state shared across suites.
+        _ = SidecarRegistry.killAll { _, _ in -1 }
+        #expect(SidecarRegistry.isQuitting)
+        _ = SidecarRegistry.killAll { _, _ in -1 }   // idempotent: still true
+        #expect(SidecarRegistry.isQuitting)
+    }
+
     @Test func killAllIsSynchronousAndSafeToCallFromANonMainThread() async {
         let pid = fakePid()
         SidecarRegistry.register(pid: pid)

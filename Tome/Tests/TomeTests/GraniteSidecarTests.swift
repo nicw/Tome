@@ -87,14 +87,19 @@ private func waitFor(_ condition: @autoclosure @escaping () -> Bool) async throw
     }
 }
 
+/// `isQuitting` defaults to `{ false }` here (NOT the production default of
+/// `SidecarRegistry.isQuitting`): the registry's quitting gate is permanent
+/// process-global state that SidecarRegistryTests flip via killAll() in this
+/// same test process, and these tests must not depend on suite ordering.
 private func makeSidecar(launcher: FakeLauncher = FakeLauncher(), http: FakeHTTP = FakeHTTP(),
                           readyTimeout: TimeInterval = 1,
-                          sleep: @escaping @Sendable (TimeInterval) async -> Void = { _ in })
+                          sleep: @escaping @Sendable (TimeInterval) async -> Void = { _ in },
+                          isQuitting: @escaping @Sendable () -> Bool = { false })
     -> (GraniteSidecar, FakeLauncher, FakeHTTP) {
     let config = ShadowConfig(serverPath: "/fake/llama-server",
                               modelDir: URL(fileURLWithPath: "/fake/models"), port: 9999)
     let s = GraniteSidecar(config: config, launcher: launcher, http: http,
-                           readyTimeout: readyTimeout, sleep: sleep)
+                           readyTimeout: readyTimeout, sleep: sleep, isQuitting: isQuitting)
     return (s, launcher, http)
 }
 
@@ -151,6 +156,53 @@ private struct ConnErr: Error {}
         #expect(await s.start() == false)
         #expect(launcher.launched.count == 0)
         #expect(await s.state == .failed)
+    }
+
+    @Test func stopDuringPrelaunchProbeYieldsIdleNotFailedEvenOn200() async throws {
+        // A stop() interleaving during the pre-launch probe suspension must
+        // win over the probe's outcome: releasing the probe with a 200
+        // (foreign server present) must NOT stomp state = .failed over the
+        // .idle that stop() just established — and must not launch anything.
+        let (s, launcher, http) = makeSidecar()
+        http.healthResults = [200]         // probe would report a foreign server
+        http.hangHealthAtCallNumber = 1     // park the probe itself
+        let job = Task { await s.start() }
+        try await waitFor(http.healthParked)
+        #expect(http.healthParked)
+
+        await s.stop()
+        http.releaseHealth()
+
+        #expect(await job.value == false)
+        #expect(await s.state == .idle)     // stop()'s .idle survives, not .failed
+        #expect(launcher.launched.count == 0)
+    }
+
+    // MARK: - app-quit gate (kill-vs-relaunch race)
+
+    @Test func startRefusesToLaunchWhenAppIsQuitting() async {
+        let (s, launcher, _) = makeSidecar(isQuitting: { true })
+        #expect(await s.start() == false)
+        #expect(launcher.launched.count == 0)
+        #expect(await s.state == .failed)
+    }
+
+    @Test func postFailureWhileQuittingRethrowsWithoutRelaunch() async {
+        // The kill-vs-relaunch race: SidecarRegistry.killAll() terminates the
+        // server from the main thread while this actor's transcribe() is
+        // suspended in http.post. The dropped connection must NOT take the
+        // relaunch branch (state still .ready, Task not cancelled, relaunch
+        // budget unspent) — that would spawn and register a fresh child AFTER
+        // killAll's victim snapshot, orphaning it.
+        final class Gate: @unchecked Sendable { var quitting = false }
+        let gate = Gate()
+        let (s, launcher, http) = makeSidecar(isQuitting: { gate.quitting })
+        http.postResults = [.failure(ConnErr()), .success((ok, 200))]  // trailing sentinel
+        _ = await s.start()
+        gate.quitting = true   // killAll() has run; connection then drops
+        await #expect(throws: ConnErr.self) { try await s.transcribe(wavData: Data([1])) }
+        #expect(launcher.launched.count == 1)   // no relaunch spawned past the kill snapshot
+        #expect(http.postResults.count == 1)    // sentinel untouched — no retry post either
     }
 
     @Test func startFailsFastWhenChildDiesBeforeHealthy() async throws {

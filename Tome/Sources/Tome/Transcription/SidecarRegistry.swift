@@ -23,30 +23,51 @@ enum SidecarRegistry {
     /// (the standard "kill(pid, 0) == 0 means still alive" idiom).
     typealias Signaler = @Sendable (Int32, Int32) -> Int32
 
-    private static let state = OSAllocatedUnfairLock<Set<Int32>>(uncheckedState: [])
+    /// pids + the quitting gate share one lock so killAll's victim snapshot
+    /// and the gate flip are a single atomic step — no window where a
+    /// concurrent spawn could observe "not quitting" after the snapshot was
+    /// already taken.
+    private struct Registry {
+        var pids: Set<Int32> = []
+        var quitting = false
+    }
+
+    private static let state = OSAllocatedUnfairLock<Registry>(uncheckedState: Registry())
 
     static func register(pid: Int32) {
-        state.withLock { pids in _ = pids.insert(pid) }
+        state.withLock { r in _ = r.pids.insert(pid) }
     }
 
     static func unregister(pid: Int32) {
-        state.withLock { pids in _ = pids.remove(pid) }
+        state.withLock { r in _ = r.pids.remove(pid) }
     }
 
     /// Test/inspection only.
-    static var registeredPids: Set<Int32> { state.withLock { $0 } }
+    static var registeredPids: Set<Int32> { state.withLock { $0.pids } }
+
+    /// True once killAll() has run — the app is exiting. GraniteSidecar
+    /// checks this at both of its spawn points (start(), and transcribe()'s
+    /// relaunch branch) so an in-flight job whose connection drops DURING
+    /// the kill can't respawn a fresh llama-server after killAll's victim
+    /// snapshot was taken: killAll blocks the caller's thread (main, at
+    /// quit), but the sidecar actor keeps running on its own executor.
+    /// Never reset — there is no un-quit.
+    static var isQuitting: Bool { state.withLock { $0.quitting } }
 
     /// SIGTERM every registered pid, poll for up to `graceSeconds` (50ms
     /// steps via `usleep`) for each to exit, then SIGKILL any stragglers.
     /// Synchronous and safe to call from any thread — callers include
     /// `applicationShouldTerminate`, which is not async. Idempotent: the
     /// registry is drained atomically up front, so a second call (or a
-    /// concurrent one) has nothing left to act on.
+    /// concurrent one) has nothing left to act on. Also flips the permanent
+    /// `isQuitting` gate in the same lock acquisition as the snapshot, so no
+    /// new sidecar can be spawned after the victims are chosen.
     @discardableResult
     static func killAll(graceSeconds: TimeInterval = 2.0, signaler: Signaler = kill) -> Int {
-        let victims = state.withLock { pids -> Set<Int32> in
-            defer { pids.removeAll() }
-            return pids
+        let victims = state.withLock { r -> Set<Int32> in
+            r.quitting = true
+            defer { r.pids.removeAll() }
+            return r.pids
         }
         guard !victims.isEmpty else { return 0 }
         for pid in victims { _ = signaler(pid, SIGTERM) }
