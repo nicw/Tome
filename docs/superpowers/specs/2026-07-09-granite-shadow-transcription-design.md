@@ -342,7 +342,9 @@ No WER claims — no ground truth. The report structures Nic's eyeball pass.
 
 ## Success criteria
 
-**Phase 0 gates (before building shadow mode):**
+**Phase 0 gates (before *enabling* shadow mode — building may proceed in
+parallel; the gates protect the shadow data's trustworthiness, and the
+schedule needs shadow capturing meetings from Friday 2026-07-10):**
 1. Fidelity: granite via our llama-server pipeline reproduces its published
    AMI + Earnings-22 raw WER within ~1.5 points absolute.
 2. Speed: RTF on M2 Max ≤ ~0.25 (hour meeting in ≤ 15 min).
