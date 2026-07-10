@@ -58,7 +58,23 @@ final class TranscriptionEngine {
     /// `PostProcessingQueue` — live streaming and batch re-transcription must route
     /// through one actor for safe interleaving.
     let asrCoordinator: ASRCoordinator
+
+    /// The shared VAD manager, loaded once and reused for the lifetime of the
+    /// engine. Loading a `VadManager` takes ~1.7–2.1s on an M2 Max; doing it on
+    /// every `start()` (the old behavior) delayed the mic-tap install by that
+    /// much, trimming the opening ~2s off every recording. It is deliberately
+    /// NOT nilled in `stop()` — the CoreML model is immutable and streaming
+    /// state is per-run (see `loadVADManager`), so one instance serves every
+    /// session and both the mic + system transcribers concurrently.
     private var vadManager: VadManager?
+
+    /// Single-flight handle for an in-progress VAD load. `preloadVAD()` (fired at
+    /// launch) and an early `start()` can race; both run on `@MainActor`, so they
+    /// only interleave at awaits. Sharing one load `Task` (rather than each
+    /// constructing a `VadManager`) guarantees the two callers await the SAME
+    /// load instead of double-loading. Matches ModelProvisioner's task-tracking
+    /// style. Nil when no load is in flight.
+    private var vadLoadTask: Task<VadManager, Error>?
 
     /// The WAV buffer path for the currently-capturing session. The engine owns this URL
     /// between start and stop; post-processing methods use it explicitly rather than
@@ -92,6 +108,53 @@ final class TranscriptionEngine {
         self.asrCoordinator = asrCoordinator
     }
 
+    /// Load (or reuse) the shared VAD manager, single-flighted.
+    ///
+    /// Reuse across sessions and across the concurrent mic/system transcribers is
+    /// safe: `FluidAudio.VadManager` is an actor whose only stored state is the
+    /// immutable CoreML model + config + serialized ANE buffer pool. All
+    /// per-run streaming state lives OUTSIDE the manager — `makeStreamState()`
+    /// returns a fresh `VadStreamState` and `processStreamingChunk(state:)`
+    /// threads it in and out — so one manager instance can serve every recording
+    /// (verified against .build/checkouts/FluidAudio VadManager.swift +
+    /// VadManager+Streaming.swift; the two live transcribers already share one).
+    ///
+    /// Single-flight: if a load is already in flight (preload racing start()),
+    /// both callers await the same `Task` rather than each building a manager.
+    /// The `vadManager == nil` fast path and the task handle are only read/written
+    /// on `@MainActor`, so the guard/assignment can only interleave at the await
+    /// on `task.value` — which is exactly what the shared handle covers.
+    private func loadVADManager() async throws -> VadManager {
+        if let vadManager { return vadManager }
+        if let vadLoadTask { return try await vadLoadTask.value }
+        let task = Task { try await VadManager() }
+        vadLoadTask = task
+        do {
+            let manager = try await task.value
+            vadManager = manager
+            vadLoadTask = nil
+            return manager
+        } catch {
+            // Clear the failed handle so a later start()/preload can retry.
+            vadLoadTask = nil
+            throw error
+        }
+    }
+
+    /// Warm the VAD model at app launch so the first recording doesn't lose ~2s
+    /// to an on-demand load between `start()` and the mic-tap install. Fire this
+    /// and forget from ContentView's boot task; it single-flights with `start()`
+    /// via `loadVADManager`, so an early record while preloading shares one load.
+    func preloadVAD() async {
+        do {
+            _ = try await loadVADManager()
+            diagLog("[ENGINE-VAD-PRELOAD] VAD model preloaded")
+        } catch {
+            // Non-fatal: start() will load it on demand (and surface any error there).
+            diagLog("[ENGINE-VAD-PRELOAD-FAIL] \(error.localizedDescription)")
+        }
+    }
+
     func start(
         locale: Locale,
         inputDeviceID: AudioDeviceID = 0,
@@ -120,10 +183,15 @@ final class TranscriptionEngine {
             guard await asrCoordinator.isReady else {
                 throw ASRCoordinatorError.notInitialized
             }
-            assetStatus = "Loading VAD model..."
-            diagLog("[ENGINE-1b] loading VAD model...")
-            let vad = try await VadManager()
-            self.vadManager = vad
+            if vadManager == nil {
+                assetStatus = "Loading VAD model..."
+                diagLog("[ENGINE-1b] loading VAD model...")
+            }
+            // Load once and reuse (single-flight — see loadVADManager). Preloaded
+            // at launch, so this is normally an instant no-op and the mic tap
+            // installs without the ~2s VAD load that used to eat the opening of
+            // every recording.
+            self.vadManager = try await loadVADManager()
 
             assetStatus = "Models ready"
             diagLog("[ENGINE-2] models ready")

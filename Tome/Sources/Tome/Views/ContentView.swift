@@ -163,6 +163,12 @@ struct ContentView: View {
             // which awaits the provisioner settling).
             services.modelProvisioner.provision(settings.transcriberModel)
 
+            // Warm the VAD model now so the first recording's mic tap installs
+            // immediately instead of stalling ~2s on an on-demand VAD load
+            // (which trimmed the opening of every recording). Fire-and-forget;
+            // it single-flights with the load inside start().
+            Task { await engine.preloadVAD() }
+
             // Sanitize the persisted mic selection: AudioDeviceIDs are transient,
             // so a device chosen last session (AirPods) may be absent — or worse,
             // its numeric id reassigned — at this launch. An absent selection left

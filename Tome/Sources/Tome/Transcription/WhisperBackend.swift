@@ -56,6 +56,18 @@ final actor WhisperBackend: ASRBackend {
         return hasCore && fm.fileExists(atPath: tokenizerJSON.path)
     }
 
+    /// Both the SDK download and the curl fallback failed. Carries both messages
+    /// so the Settings failure line explains what was actually tried.
+    enum FetchError: Error, LocalizedError {
+        case bothFailed(sdk: String, fallback: String)
+        var errorDescription: String? {
+            switch self {
+            case .bothFailed(let sdk, let fallback):
+                return "Model download failed. SDK: \(sdk) — curl fallback: \(fallback)"
+            }
+        }
+    }
+
     func prepare(onEvent: @Sendable @escaping (PrepareEvent) -> Void) async throws {
         guard whisperKit == nil else { return }
         let variant = Self.resolveVariant()
@@ -65,13 +77,36 @@ final actor WhisperBackend: ASRBackend {
             onEvent(.loading)
         } else {
             onEvent(.downloading(progress: 0))
-            folder = try await WhisperKit.download(
-                variant: variant,
-                downloadBase: Self.downloadBase,
-                progressCallback: { progress in
-                    onEvent(.downloading(progress: progress.fractionCompleted))
+            // Test hook: force the curl path on a healthy network so the fallback
+            // can be live-exercised without breaking URLSession's connectivity.
+            if ProcessInfo.processInfo.environment["TOME_FORCE_CURL_MODEL_FETCH"] == "1" {
+                diagLog("[WHISPER-FETCH] TOME_FORCE_CURL_MODEL_FETCH=1 — using curl fetcher directly")
+                try await Self.curlFallbackFetch(variant: variant, onEvent: onEvent)
+            } else {
+                do {
+                    _ = try await WhisperKit.download(
+                        variant: variant,
+                        downloadBase: Self.downloadBase,
+                        progressCallback: { progress in
+                            onEvent(.downloading(progress: progress.fractionCompleted))
+                        }
+                    )
+                } catch {
+                    // Some networks can't reach the HF Xet CDN via URLSession at
+                    // any timeout while curl connects fine (see CurlModelFetcher).
+                    // Fall back to curl; if THAT also fails, throw the original
+                    // SDK error annotated with both so Settings is informative.
+                    diagLog("[WHISPER-FETCH] SDK download failed (\(error.localizedDescription)) — falling back to curl fetcher")
+                    do {
+                        try await Self.curlFallbackFetch(variant: variant, onEvent: onEvent)
+                    } catch let fallbackError {
+                        throw FetchError.bothFailed(
+                            sdk: error.localizedDescription,
+                            fallback: fallbackError.localizedDescription)
+                    }
                 }
-            )
+            }
+            folder = Self.modelFolder(variant: variant)
             onEvent(.loading)
         }
         let config = WhisperKitConfig(
@@ -82,6 +117,30 @@ final actor WhisperBackend: ASRBackend {
             download: false
         )
         whisperKit = try await WhisperKit(config)
+    }
+
+    /// Fetch the model variant + tokenizer via curl into the same on-disk layout
+    /// the SDK download produces, so the subsequent `WhisperKitConfig` load
+    /// (folder = `modelFolder(variant:)`) is identical. The variant is the bulk,
+    /// so it drives 0…0.9 of the reported progress; the tokenizer drives 0.9…1.0.
+    private static func curlFallbackFetch(
+        variant: String,
+        onEvent: @Sendable @escaping (PrepareEvent) -> Void
+    ) async throws {
+        try await CurlModelFetcher.fetchVariant(
+            repo: "argmaxinc/whisperkit-coreml",
+            path: variant,
+            into: downloadBase,
+            onProgress: { p in onEvent(.downloading(progress: p * 0.9)) }
+        )
+        // Tokenizer lives in a DIFFERENT repo (see tokenizerJSON); fetch just the
+        // files an offline load needs rather than the whole multi-GB repo.
+        try await CurlModelFetcher.fetchFiles(
+            repo: "openai/whisper-large-v3",
+            files: ["tokenizer.json", "tokenizer_config.json", "config.json"],
+            into: downloadBase,
+            onProgress: { p in onEvent(.downloading(progress: 0.9 + p * 0.1)) }
+        )
     }
 
     func transcribe(samples: [Float], language: Language) async throws -> ASRResult {
