@@ -33,6 +33,11 @@ actor GraniteSidecar {
     private let sleep: @Sendable (TimeInterval) async -> Void
     private var process: (any SidecarProcess)?
     private var didRelaunch = false
+    /// Monotonic teardown generation (pattern: ASRCoordinator.lastInstallToken).
+    /// stop() bumps it; an in-flight start() or relaunch that captured an older
+    /// value is stale and must tear down rather than surface a running process —
+    /// every await in those paths is an interleaving opportunity for stop().
+    private var generation = 0
     private(set) var state: State = .idle
 
     init(config: ShadowConfig,
@@ -49,11 +54,18 @@ actor GraniteSidecar {
 
     @discardableResult
     func start() async -> Bool {
+        let gen = generation
         // Guard against a second start() while a process is already tracked
         // (ready or mid-poll) — without this, the prior handle would be
         // silently overwritten below and its llama-server orphaned.
         if process != nil {
             await endProcess()
+            // stop() may have landed during endProcess's grace suspension —
+            // honor it: don't launch a replacement the caller just tore down.
+            guard generation == gen else {
+                state = .idle
+                return false
+            }
         }
         do {
             process = try launcher.launch(
@@ -69,7 +81,18 @@ actor GraniteSidecar {
         }
         let iterations = Int(readyTimeout / 0.5)
         for _ in 0..<iterations {
-            if await http.healthStatus(config.baseURL.appendingPathComponent("health")) == 200 {
+            let status = await http.healthStatus(config.baseURL.appendingPathComponent("health"))
+            // Both the healthStatus await above and the sleep below are
+            // interleaving opportunities for stop(). Re-check the generation
+            // BEFORE honoring a 200 — otherwise a stop() that already tore
+            // down our process would be followed by state = .ready, reporting
+            // a live sidecar after stop() returned (resurrection).
+            guard generation == gen else {
+                await endProcess()
+                state = .idle
+                return false
+            }
+            if status == 200 {
                 state = .ready
                 return true
             }
@@ -77,7 +100,8 @@ actor GraniteSidecar {
         }
         diagLog("[SHADOW] sidecar not healthy within \(readyTimeout)s — killing")
         await endProcess()
-        state = .failed
+        // A stop() during the final endProcess grace wins over .failed.
+        state = (generation == gen) ? .failed : .idle
         return false
     }
 
@@ -110,8 +134,23 @@ actor GraniteSidecar {
             }
             diagLog("[SHADOW] request failed (\(error)) — relaunching sidecar once")
             didRelaunch = true
+            // The endProcess/start awaits below are interleaving opportunities
+            // for stop(): capture the teardown generation and re-validate after
+            // each, so a stop() landing mid-relaunch is honored instead of the
+            // relaunch resurrecting a fresh process after stop() returned.
+            let gen = generation
             await endProcess()
-            guard await start() else { throw SidecarError.requestFailed }
+            guard generation == gen else {
+                state = .idle
+                throw SidecarError.notReady
+            }
+            let started = await start()
+            guard generation == gen else {
+                await endProcess()
+                state = .idle
+                throw SidecarError.notReady
+            }
+            guard started else { throw SidecarError.requestFailed }
             // Recurse so a failure on the retried attempt is handled by the
             // same didRelaunch-guarded catch above (fails the sidecar and
             // marks .failed instead of leaking a third http.post call).
@@ -120,8 +159,13 @@ actor GraniteSidecar {
     }
 
     func stop() async {
-        await endProcess()
+        // Bump first: invalidates any in-flight start()/relaunch that captured
+        // an older generation. Rest state before the endProcess suspension so a
+        // reentrant transcribe() sees not-ready instead of posting to a
+        // process that is mid-teardown (and then relaunching it).
+        generation += 1
         state = .idle
+        await endProcess()
     }
 
     /// Terminate then escalate to SIGKILL after a bounded grace period, using
