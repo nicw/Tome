@@ -196,6 +196,10 @@ struct DefaultProcessLauncher: SidecarProcessLauncher {
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         try p.run()
+        // Registered process-globally (not just held by this GraniteSidecar
+        // instance) so the app's quit path can kill it even if the sidecar
+        // that spawned it has already gone out of scope — see SidecarRegistry.
+        SidecarRegistry.register(pid: p.processIdentifier)
         return RealSidecarProcess(process: p)
     }
 }
@@ -208,9 +212,18 @@ final class RealSidecarProcess: SidecarProcess, @unchecked Sendable {
     private let process: Process
     init(process: Process) { self.process = process }
     var isRunning: Bool { process.isRunning }
-    func terminate() { if process.isRunning { process.terminate() } }
-    func forceKill() { if process.isRunning { kill(process.processIdentifier, SIGKILL) } }
-    deinit { if process.isRunning { process.terminate() } }
+    func terminate() {
+        if process.isRunning { process.terminate() }
+        SidecarRegistry.unregister(pid: process.processIdentifier)
+    }
+    func forceKill() {
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        SidecarRegistry.unregister(pid: process.processIdentifier)
+    }
+    deinit {
+        if process.isRunning { process.terminate() }
+        SidecarRegistry.unregister(pid: process.processIdentifier)
+    }
 }
 
 struct URLSessionSidecarHTTP: SidecarHTTP {

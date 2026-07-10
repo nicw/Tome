@@ -245,6 +245,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let response = alert.runModal()
         if response == .alertSecondButtonReturn {
+            // A shadow-phase sidecar may still be running in the queue's
+            // in-flight job; nothing outside Transcription/ holds a reference
+            // to it, so this process-global kill is the only way to
+            // guarantee it doesn't outlive Tome.
+            SidecarRegistry.killAll()
             queue.shutdown()
             return .terminateNow
         }
@@ -256,6 +261,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             while queue.isAnyJobRunning && Date() < deadline {
                 try? await Task.sleep(for: .milliseconds(250))
             }
+            // Same backstop as the "Quit Anyway" branch above: the 60s cap
+            // may expire with a shadow sidecar still live in the job that's
+            // about to be torn down by shutdown().
+            SidecarRegistry.killAll()
             queue.shutdown()
             NSApp.reply(toApplicationShouldTerminate: true)
         }
