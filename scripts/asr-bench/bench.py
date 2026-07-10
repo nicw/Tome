@@ -39,10 +39,13 @@ DATASETS = {
     "earnings22": ("hf-audio/open-asr-leaderboard", "earnings22", None),
     "tedlium": ("distil-whisper/tedlium", "default", "refs/convert/parquet"),
 }
-# TED-LIUM STM scoring-gap / non-speech markers (mirrors open_asr_leaderboard's
-# `ignore_segments` filtering, which upstream's now-unusable loading script applied
-# at generation time). Matched against the *raw* (pre-normalization) reference text.
-SKIP_MARKERS = {"ignore_time_segment_in_scoring", "<unk>", ""}
+# TED-LIUM STM scoring-gap / non-speech markers (mirrors hf-audio/esb-datasets-test-only's
+# TED-LIUM `ignore_segments` set from datasets-test-only.py, which upstream's now-unusable
+# loading script applied at generation time). Matched against the *raw* (pre-normalization) reference text.
+# Source: https://huggingface.co/datasets/hf-audio/esb-datasets-test-only/raw/main/datasets-test-only.py
+SKIP_MARKERS = {"ignore_time_segment_in_scoring", "<unk>", "<noise>", "<music>", "[noise]",
+                "[laughter]", "[silence]", "[vocalized-noise]", "<crosstalk>", "<affirmative>",
+                "<inaudible>", "<laugh>", ""}
 
 
 def export(work, sets, max_hours):
