@@ -23,4 +23,12 @@ import Testing
         let samples = (data.count - 44) / 2
         #expect(abs(samples - 16000) < 64)   // ~1 s at 16 kHz (converter may prime ±)
     }
+    @Test func convertsMono8kTo16k() throws {
+        let fmt = AVAudioFormat(standardFormatWithSampleRate: 8000, channels: 1)!
+        let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 8000)!
+        buf.frameLength = 8000  // 1 second of silence at 8 kHz
+        let data = try AudioWAVExport.wav16kMonoPCM16(from: buf)
+        let samples = (data.count - 44) / 2
+        #expect(abs(samples - 16000) < 64)   // ~1 s at 16 kHz (converter may prime ±)
+    }
 }

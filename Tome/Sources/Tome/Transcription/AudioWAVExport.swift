@@ -15,13 +15,29 @@ enum AudioWAVExport {
         guard let out = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: capacity)
         else { throw ExportError.conversionFailed }
         var fed = false
-        var error: NSError?
-        converter.convert(to: out, error: &error) { _, status in
-            if fed { status.pointee = .endOfStream; return nil }
-            fed = true; status.pointee = .haveData; return buffer
+        var totalFrames: AVAudioFrameCount = 0
+
+        // Drain loop: keep converting until converter exhausts input/output or reports error
+        while true {
+            var drainError: NSError?
+            let status = converter.convert(to: out, error: &drainError) { _, status in
+                if fed { status.pointee = .endOfStream; return nil }
+                fed = true; status.pointee = .haveData; return buffer
+            }
+            if let drainError { throw drainError }
+            totalFrames += out.frameLength
+            if status == .endOfStream || out.frameLength == 0 { break }
+            if status == .error { throw ExportError.conversionFailed }
+            out.frameLength = 0  // Reset for next iteration
         }
-        if let error { throw error }
-        let byteCount = Int(out.frameLength) * 2
+
+        // Sanity check: output length should be ~expected; silent truncation is an error
+        let expected = Double(buffer.frameLength) * 16000.0 / buffer.format.sampleRate
+        if Double(totalFrames) < expected - 4096 {
+            throw ExportError.conversionFailed
+        }
+
+        let byteCount = Int(totalFrames) * 2
         var data = riffHeader(dataByteCount: byteCount)
         data.append(Data(bytes: out.int16ChannelData![0], count: byteCount))
         return data
