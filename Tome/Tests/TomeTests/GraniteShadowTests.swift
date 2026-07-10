@@ -70,6 +70,33 @@ private struct Boom: Error {}
         #expect(mdText.contains("granite-speech-4.1-2b-Q8_0"))
     }
 
+    // Overlapping-speaker diarization can produce two merged segments that
+    // share a startTime but belong to different speakers. Keying the pairing
+    // dict on startTime alone collides and drops one primary text (FIX 5) —
+    // this pins the startTime+speaker key so both pair correctly.
+    @Test func artifactsPairBySameStartTimeDifferentSpeakers() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let session = ShadowSessionInfo(sessionID: "s2", transcriptPath: "/t.md",
+                                        sessionType: "callCapture",
+                                        primaryModel: "Parakeet-TDT v3",
+                                        graniteModel: "granite-speech-4.1-2b-Q8_0")
+        let primary = [
+            ReTranscribedSegment(speaker: "Speaker 2", text: "primary A", startTime: 5.0),
+            ReTranscribedSegment(speaker: "Speaker 3", text: "primary B", startTime: 5.0),
+        ]
+        let shadow = ShadowRunOutput(segments: [
+            ShadowSegment(startTime: 5.0, speaker: "Speaker 2", durationSec: 1, text: "shadow A", error: nil, latencySec: 0.1),
+            ShadowSegment(startTime: 5.0, speaker: "Speaker 3", durationSec: 1, text: "shadow B", error: nil, latencySec: 0.1),
+        ], incomplete: false)
+        let (_, json) = try ShadowArtifacts.write(session: session, primary: primary, shadow: shadow, to: dir)
+        let comparison = try JSONDecoder().decode(ShadowComparison.self, from: Data(contentsOf: json))
+        let bySpeaker = Dictionary(uniqueKeysWithValues: comparison.segments.map { ($0.speaker, $0) })
+        #expect(bySpeaker["Speaker 2"]?.primaryText == "primary A")
+        #expect(bySpeaker["Speaker 2"]?.graniteText == "shadow A")
+        #expect(bySpeaker["Speaker 3"]?.primaryText == "primary B")
+        #expect(bySpeaker["Speaker 3"]?.graniteText == "shadow B")
+    }
+
     // -- corrections coverage: readSegment throws (allocation-nil vs read-error) --
     @Test func runnerRecordsAllocationFailureDistinctFromReadFailure() async throws {
         let wav = try fixtureWAV()

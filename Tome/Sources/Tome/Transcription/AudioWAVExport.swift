@@ -16,8 +16,19 @@ enum AudioWAVExport {
         else { throw ExportError.conversionFailed }
         var fed = false
         var totalFrames: AVAudioFrameCount = 0
+        var pcmData = Data()
 
-        // Drain loop: keep converting until converter exhausts input/output or reports error
+        // Drain loop: keep converting until converter exhausts input/output or
+        // reports error. Each iteration's produced bytes are appended to
+        // `pcmData` immediately, before `out` is reset for the next iteration —
+        // correct regardless of whether convert() ever splits its output across
+        // multiple .haveData chunks (a single iteration is the common case
+        // here, since `capacity` is sized to fit the whole conversion up
+        // front, but nothing below depends on that). The previous version
+        // copied bytes only once, after the loop, from whatever `out` held on
+        // the FINAL iteration — correct only by the single-iteration
+        // assumption; a real multi-chunk conversion would have discarded the
+        // earlier chunks' samples while still counting their frames.
         while true {
             var drainError: NSError?
             let status = converter.convert(to: out, error: &drainError) { _, status in
@@ -25,9 +36,12 @@ enum AudioWAVExport {
                 fed = true; status.pointee = .haveData; return buffer
             }
             if let drainError { throw drainError }
-            totalFrames += out.frameLength
-            if status == .endOfStream || out.frameLength == 0 { break }
             if status == .error { throw ExportError.conversionFailed }
+            if out.frameLength > 0 {
+                pcmData.append(Data(bytes: out.int16ChannelData![0], count: Int(out.frameLength) * 2))
+                totalFrames += out.frameLength
+            }
+            if status == .endOfStream || out.frameLength == 0 { break }
             out.frameLength = 0  // Reset for next iteration
         }
 
@@ -37,9 +51,8 @@ enum AudioWAVExport {
             throw ExportError.conversionFailed
         }
 
-        let byteCount = Int(totalFrames) * 2
-        var data = riffHeader(dataByteCount: byteCount)
-        data.append(Data(bytes: out.int16ChannelData![0], count: byteCount))
+        var data = riffHeader(dataByteCount: pcmData.count)
+        data.append(pcmData)
         return data
     }
 

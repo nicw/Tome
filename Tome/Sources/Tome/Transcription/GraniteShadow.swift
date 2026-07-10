@@ -159,16 +159,23 @@ enum ShadowArtifacts {
     static func write(session: ShadowSessionInfo, primary: [ReTranscribedSegment],
                       shadow: ShadowRunOutput, to dir: URL) throws -> (md: URL, json: URL) {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        // Pair by merged-segment startTime (spec §4: primary skips empty-text
-        // segments, so array positions don't line up; "" marks a missing side).
-        // Both sides derive startTime from the same SegmentAudio.merge(...) output
-        // (Float, same source segments) so equality-keyed pairing is safe here.
-        let primaryByStart = Dictionary(primary.map { ($0.startTime, $0.text) },
-                                        uniquingKeysWith: { a, _ in a })
+        // Pair by merged-segment startTime + speaker (spec §4: primary skips
+        // empty-text segments, so array positions don't line up; "" marks a
+        // missing side). Both sides derive startTime from the same
+        // SegmentAudio.merge(...) output (Float, same source segments), but
+        // startTime ALONE isn't unique: overlapping-speaker diarization can
+        // produce two merged segments with an identical startTime for
+        // different speakers, and keying on startTime alone would collide
+        // (uniquingKeysWith silently drops one primary text). A same-speaker
+        // same-startTime pair can't survive merge(), so startTime+speaker is
+        // unique on both sides.
+        func pairKey(startTime: Float, speaker: String) -> String { "\(startTime)|\(speaker)" }
+        let primaryByKey = Dictionary(primary.map { (pairKey(startTime: $0.startTime, speaker: $0.speaker), $0.text) },
+                                      uniquingKeysWith: { a, _ in a })
         let segments = shadow.segments.map { s in
             ShadowComparisonSegment(startTime: s.startTime, speaker: s.speaker,
                                     durationSec: s.durationSec,
-                                    primaryText: primaryByStart[s.startTime] ?? "",
+                                    primaryText: primaryByKey[pairKey(startTime: s.startTime, speaker: s.speaker)] ?? "",
                                     graniteText: s.text ?? "",
                                     graniteError: s.error,
                                     graniteLatencySec: s.latencySec)
