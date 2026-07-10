@@ -156,3 +156,37 @@ status` clean except this doc.
 
 Shadow is live for Friday's meetings; review lands EOD Wednesday 2026-07-15
 via `scripts/granite-shadow-report.py`.
+
+## Reinstall (final-review fixes, fc8ab15)
+
+2026-07-10 ~01:10–01:14 local, unattended. The whole-branch final review
+landed five fix commits after the live-smoke install (sidecar
+orphan-on-quit registry, foreign-server adoption refusal, HTTP-status
+handling in post(), `-c 16384 --no-webui` launch args, pairing-key
+collision, quitting-gate race) — the running app predated them, so the same
+install discipline was repeated on build
+`fc8ab1535277e7d216e22dff2bc9caea81134465` (144/144 tests green).
+
+- **Sidecar-args sanity (pre-install):** manually launched llama-server with
+  the NEW args (`-m … --mmproj … --host 127.0.0.1 --port 8873 -c 16384
+  --no-webui`); /health 200 in ~1 s; `granite_client.py /tmp/probe.wav` →
+  "the quick brown fox jumps over the lazy dog" in 0.2 s; killed, port 8873
+  confirmed free. Note for the Wednesday review: llama.cpp warns
+  `n_ctx_seq (16384) > n_ctx_train (4096)` and allocates 4 slots of
+  `n_ctx_slot = 4096` — the args are accepted and functional, but the
+  effective per-slot context is 4096, not 16384 (and `--no-webui` is
+  deprecated spelling for `--no-ui`; still honored).
+- **Install:** same procedure as the live smoke — verified idle via API,
+  MD5-relocated the 12 orphan WAVs around the relaunch (restored,
+  re-verified identical), graceful quit (~1 s), `ditto` install, `/health`
+  up ~2 s after launch. `graniteShadowEnabled` still 1 (untouched).
+  Installed CDHash `30c668f6…`, CFBundleVersion `1.4.4-63-gfc8ab15-dirty`
+  (`-dirty` cosmetic: temporary build-script edit during the build, reverted).
+- **No audio smoke this time** (per controller: pipeline shape unchanged and
+  unit-verified; args covered by the manual sanity above). Volume and display
+  never touched — volume read-verified at baseline 50/unmuted throughout.
+- **Backups rotated:** `/tmp/tome-backup/Tome.app.bak-orig` = original
+  v1.4.4 (`1.4.4-33-g573341d`), `/tmp/tome-backup/Tome.app.bak` = outgoing
+  shadow-v1 build (`1.4.4-57-gf879620-dirty`, CDHash `91c07752…`).
+- **End state:** Tome running (fc8ab15 build, flag ON), not recording, no
+  llama-server, orphan WAVs byte-identical, git clean except this note.
