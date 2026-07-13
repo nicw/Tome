@@ -81,7 +81,16 @@ final actor WhisperBackend: ASRBackend {
             // can be live-exercised without breaking URLSession's connectivity.
             if ProcessInfo.processInfo.environment["TOME_FORCE_CURL_MODEL_FETCH"] == "1" {
                 diagLog("[WHISPER-FETCH] TOME_FORCE_CURL_MODEL_FETCH=1 — using curl fetcher directly")
-                try await Self.curlFallbackFetch(variant: variant, onEvent: onEvent)
+                // Outcome must reach the unified log: a throw here only lands in
+                // the Settings lastFailure line, which headless test runs and
+                // post-hoc log forensics can't see.
+                do {
+                    try await Self.curlFallbackFetch(variant: variant, onEvent: onEvent)
+                    diagLog("[WHISPER-FETCH] curl fetcher COMPLETED for \(variant)")
+                } catch {
+                    diagLog("[WHISPER-FETCH] curl fetcher FAILED: \(error.localizedDescription)")
+                    throw error
+                }
             } else {
                 do {
                     _ = try await WhisperKit.download(
@@ -99,7 +108,9 @@ final actor WhisperBackend: ASRBackend {
                     diagLog("[WHISPER-FETCH] SDK download failed (\(error.localizedDescription)) — falling back to curl fetcher")
                     do {
                         try await Self.curlFallbackFetch(variant: variant, onEvent: onEvent)
+                        diagLog("[WHISPER-FETCH] curl fetcher COMPLETED for \(variant)")
                     } catch let fallbackError {
+                        diagLog("[WHISPER-FETCH] curl fetcher FAILED: \(fallbackError.localizedDescription)")
                         throw FetchError.bothFailed(
                             sdk: error.localizedDescription,
                             fallback: fallbackError.localizedDescription)
