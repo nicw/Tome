@@ -190,8 +190,11 @@ final class TranscriptionEngine {
             // Load once and reuse (single-flight — see loadVADManager). Preloaded
             // at launch, so this is normally an instant no-op and the mic tap
             // installs without the ~2s VAD load that used to eat the opening of
-            // every recording.
-            self.vadManager = try await loadVADManager()
+            // every recording. loadVADManager() already assigns `self.vadManager`
+            // on its success path (mirrors preloadVAD()'s `_ = try await`), so
+            // capturing the return here would just be a redundant second write —
+            // discard it and read the property below instead.
+            _ = try await loadVADManager()
 
             assetStatus = "Models ready"
             diagLog("[ENGINE-2] models ready")

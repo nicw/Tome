@@ -20,9 +20,19 @@ import Testing
         """.data(using: .utf8)!
         let files = try CurlModelFetcher.fileList(fromTreeJSON: json)
         #expect(files == [
-            "openai_whisper-large-v3-v20240930/AudioEncoder.mlmodelc/coremldata.bin",
-            "openai_whisper-large-v3-v20240930/config.json",
+            CurlModelFetcher.RemoteFile(
+                path: "openai_whisper-large-v3-v20240930/AudioEncoder.mlmodelc/coremldata.bin", size: 123),
+            CurlModelFetcher.RemoteFile(path: "openai_whisper-large-v3-v20240930/config.json", size: 45),
         ])
+    }
+
+    @Test func fileListToleratesMissingSize() throws {
+        // Some tree entries may omit `size`; that must parse as nil, not throw.
+        let json = """
+        [{"type": "file", "path": "config.json"}]
+        """.data(using: .utf8)!
+        let files = try CurlModelFetcher.fileList(fromTreeJSON: json)
+        #expect(files == [CurlModelFetcher.RemoteFile(path: "config.json", size: nil)])
     }
 
     @Test func fileListEmptyForNoFiles() throws {
@@ -96,5 +106,35 @@ import Testing
     @Test func progressFractionClampsToUnitInterval() {
         #expect(CurlModelFetcher.progressFraction(completed: 5, total: 4) == 1)
         #expect(CurlModelFetcher.progressFraction(completed: -1, total: 4) == 0)
+    }
+
+    // MARK: - Skip-vs-redownload decision (replaces `-C -` resume; avoids HTTP 416)
+
+    @Test func shouldSkipWhenExistingSizeMatchesExpected() {
+        #expect(CurlModelFetcher.shouldSkipDownload(existingFileSize: 4096, expectedSize: 4096))
+    }
+
+    @Test func shouldNotSkipWhenExistingSizeIsSmallerThanExpected() {
+        // The common interrupted-download case: a partial file present.
+        #expect(!CurlModelFetcher.shouldSkipDownload(existingFileSize: 1024, expectedSize: 4096))
+    }
+
+    @Test func shouldNotSkipWhenExistingSizeIsLargerThanExpected() {
+        // A mismatch either way must redownload, not just a short partial.
+        #expect(!CurlModelFetcher.shouldSkipDownload(existingFileSize: 8192, expectedSize: 4096))
+    }
+
+    @Test func shouldNotSkipWhenNoFileExistsYet() {
+        #expect(!CurlModelFetcher.shouldSkipDownload(existingFileSize: nil, expectedSize: 4096))
+    }
+
+    @Test func shouldNotSkipWhenExpectedSizeIsUnknown() {
+        // `fetchFiles` (tokenizer) has no tree-listing size to compare against —
+        // must always redownload rather than trust a same-named local file.
+        #expect(!CurlModelFetcher.shouldSkipDownload(existingFileSize: 4096, expectedSize: nil))
+    }
+
+    @Test func shouldNotSkipWhenNeitherSizeIsKnown() {
+        #expect(!CurlModelFetcher.shouldSkipDownload(existingFileSize: nil, expectedSize: nil))
     }
 }
